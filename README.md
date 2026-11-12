@@ -40,3 +40,7 @@ The results highlighted the limitations of predicting flight delays using only p
 ## Project Focus
 
 This project demonstrates experience preparing datasets for analysis, comparing statistical methods, and evaluating model performance to understand the strengths and limitations of predictive approaches.
+
+## Project Report
+
+[View Full Project Report](https://ellaashburn.github.io/Predicting-Flight-Delays-/)
