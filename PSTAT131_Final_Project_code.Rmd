@@ -1,0 +1,848 @@
+---
+title: "Predicting Flight Delays"
+author: "Ella Ashburn"
+date: "2026-01-15"
+output:
+  html_document:
+    df_print: paged
+    css: styles.css
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+
+library(data.table)
+data.table::setDTthreads(1)
+```
+
+<br>
+
+```{r, echo=FALSE, out.width="80%", fig.align="center"}
+knitr::include_graphics("Loop Text GIF by xponentialdesign.gif")
+```
+
+<br>
+<br>
+
+## Introduction
+
+
+  The aim of this project is to build a machine learning model that predicts whether a flight will arrive late using airline, route, and scheduling information available prior to departure. Using U.S. domestic flight data from 2015–2018, this study frames flight delay prediction as a binary classification problem, in which flights are categorized as either delayed or on-time. 
+  Classification refers to a modeling approach in which observations are assigned to discrete groups based on their characteristics. The primary goal of this project is predictive rather than causal, meaning the goal is on developing an model that can estimate delay risk before a flight departs, rather than identifying causes of delays. 
+  The data set used in this analysis was created by Mu (n.d.) and obtained from Kaggle, with the original data sourced from the United States Department of Transportation. It contains multi-year information on U.S. domestic flights, including flight dates, airline identifiers, origin and destination airports, scheduled departure times, and recorded delay outcomes.
+
+Citation: Mu, Y. (n.d.). Airline Delay and Cancellation Data (2009–2018) [Dataset]. Kaggle. https://www.kaggle.com/datasets/yuanyuwendymu/airline-delay-and-cancellation-data-2009-2018 
+
+<br>
+
+### What makes a plane delayed?
+
+
+   In this study, a flight is classified as delayed if its total arrival delay is greater than or equal to 15 minutes. Flights with arrival delays less than 15 minutes are classified as on time. This time frame matches the commonly used definition of delay in airline on time performance reporting. Airplane delays are caused by multiple factors, most commonly, severe weather (storms, fog, snow), late-arriving aircraft from previous flights, air traffic control congestion, and crew scheduling constraints.
+
+<br>
+  
+```{r, echo=FALSE, fig.align="center", out.width="80%"}
+knitr::include_graphics("Delays.PNG")
+```
+
+<br>
+
+### Why is this model Useful
+
+
+  Almost everybody has experienced a flight delay before, with about 19% of all flights being delayed. Therefore, the ability to anticipate delays can prevent missed connections, additional costs, or many other inconveniences. This classification model can give users insight into whether their plane is at risk of being delayed based on past flights, which will allow people to make more informed decisions about there travels. \newline
+
+<br>
+
+## Exploratory Data Analysis 
+In order to start modeling, our data needs to first be tidied for our specific project. First we need to downsize our data set to our target years of 2015-2018. We will also only keep the predictor variables for a flight delay. Then we will carefully handle the data's missing values ensuring there removal wont change the integrity of the data. 
+
+Before modeling can begin, the data set must first be tidied to align with the goals of this project. The data is first restricted to the target years of 2015–2018. Then only predictor variables available prior to departure are kept, including airline, route, and scheduling information. Additionally, missing values are carefully examined and removed only after verifying that their exclusion does not introduce bias to the data set. 
+
+## Load in necessary packages
+```{r,include=TRUE, warning=FALSE, message=FALSE}
+library(tidyverse)   # data manipulation & visualization
+library(data.table)  #  data loading
+library(caret)       # modeling framework
+library(randomForest)# random forest model
+library(pROC)        # ROC curves & AUC
+library(readr)
+library(dplyr)
+```
+
+
+### Load in and Tidy to 2015-2018 Flight Data only
+
+Since the entire data set is so large we will be testing our model with flight data only from 2015-2018
+
+
+```{r build_data_1, eval=FALSE}
+# single-thread for stability on macOS
+data.table::setDTthreads(1)
+
+# Load in data folder
+folder <- "/Users/beepbop/Desktop/PSTAT 131/Project/Airline_Delay_Data _2008-2019"
+
+# Choose only data from 2015-2018
+files <- list.files(folder, pattern = "2015|2016|2017|2018", full.names = TRUE)
+
+```
+
+
+### Establish variables to keep, predictor variables, and variables used for cleaning
+```{r build_data_2, eval=FALSE}
+
+# select variables to keep 
+keep <- c("FL_DATE","OP_CARRIER","OP_CARRIER_FL_NUM","ORIGIN","DEST","CRS_DEP_TIME","ARR_DELAY","CANCELLED")
+
+
+# Keep only these variables in data set 
+df_list <- lapply(files, function(f) {
+  read_csv(f, show_col_types = FALSE) %>%
+    select(any_of(keep))
+})
+
+```
+
+
+### Remove cancelled flights and create random sample
+
+
+Since cancelled flights never actually depart, they can’t really be classified as delayed or not delayed. Because of this, we remove those observations from the dataset. We then randomly sample 300,000 flights per year from the remaining data within our time period. This keeps the dataset at a manageable size so the analysis can run efficiently, while still retaining enough observations to maintain reliable results.
+
+
+```{r build_data_3, eval=FALSE}
+
+# Apply function to:
+# remove cancelled flights 
+# randomly samples 300,000 flights each year 
+
+df_list <- lapply(df_list, as.data.table)
+
+set.seed(14)
+
+df_list <- lapply(df_list, function(d) {
+  d <- d[CANCELLED != 1]               # remove cancelled flights
+  d[sample(.N, min(300000, .N))]       # sample up to 300k per year
+})
+
+# combines all data from 2015-2018 into one data set 
+flight_data_df <- rbindlist(df_list, use.names = TRUE, fill = TRUE)
+
+saveRDS(flight_data_df, "flight_data_df.rds")
+
+```
+
+```{r load_data, message=FALSE, warning=FALSE}
+flight_data_df <- readRDS("flight_data_df.rds")
+```
+
+### Data set size and missing variables
+```{r}
+nrow(flight_data_df)
+any(is.na(flight_data_df))
+sum(is.na(flight_data_df))
+
+```
+
+After removing cancelled flights and combining the sampled yearly data sets, the final data set contains approximately 1.2 million observations. Missing values are present, but the total number of missing entries (3,133) is very small relative to the overall data set size. However we must check that this these values are not concentrated to specific airline, airport, or time window before any missing values are removed. 
+
+<br>
+
+#### Check missing values concentrated by Airline
+```{r}
+flight_data_df %>%
+  filter(is.na(ARR_DELAY)) %>%
+  count(OP_CARRIER) %>%
+  arrange(desc(n)) %>%
+  ggplot(aes(x = reorder(OP_CARRIER, n), y = n)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Missing Arrival Delay Values by Airline",
+    x = "Airline",
+    y = "Number of Missing Values"
+  )
+
+```
+
+#### Check missing values concentrated by origin airport (Top 15)
+```{r}
+flight_data_df %>%
+  filter(is.na(ARR_DELAY)) %>%
+  count(ORIGIN) %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 15) %>%
+  ggplot(aes(x = reorder(ORIGIN, n), y = n)) +
+  geom_col(fill = "darkorange") +
+  coord_flip() +
+  labs(
+    title = "Top 15 Origin Airports with Missing Arrival Delay Values",
+    x = "Origin Airport",
+    y = "Number of Missing Values"
+  )
+```
+
+#### Check missing arrival values by Year
+```{r}
+flight_data_df %>%
+  mutate(year = substr(FL_DATE, 1, 4)) %>%
+  filter(is.na(ARR_DELAY)) %>%
+  count(year) %>%
+  ggplot(aes(x = year, y = n)) +
+  geom_col(fill = "forestgreen") +
+  labs(
+    title = "Missing Arrival Delay Values by Year",
+    x = "Year",
+    y = "Number of Missing Values"
+  )
+```
+
+From these graphs it can be seen that missing values was distributed across many airlines and airports, with higher counts observed primarily for large carriers and major hub airports, which is expected given their higher flight volumes. Missing values were also evenly distributed across years from 2015 to 2018. No strong evidence of concentration within a particular airline, airport, or time period was observed. Because missing values represents a very small fraction of the data set and appears not concentrated any where in the data, observations containing missing predictor values can be removed. 
+
+<br>
+
+### Remove Missing Values
+```{r}
+flight_data_df <- na.omit(flight_data_df)
+any(is.na(flight_data_df))
+sum(is.na(flight_data_df))
+nrow(flight_data_df)
+```
+After removing the missing values the data set now contains 1.19 million rows. 
+
+<br>
+
+### Creating Response Variable 
+
+
+In order predict if a flight is delayed as a classification model, we must create  response variable using the standard 15-minute threshold for arrival delay. In this variable flights with an arrival delay greater than or equal to 15 minutes are classified as delayed, while all others are classified as on-time.
+
+```{r}
+flight_data_df <- flight_data_df %>%
+  mutate(delayed = factor(ifelse(ARR_DELAY >= 15, 1, 0),
+                          levels = c(0,1),
+                          labels = c("Not Delayed","Delayed")))
+
+head(flight_data_df)
+```
+
+<br>
+
+## Codebook
+
+Now that we have cleaned and tidied our data set, only the variables relevant to predicting if a flight will be delayed were kept. These are all the variables we will use in our analysis:
+
+**FL_DATE**  <br>
+Scheduled calendar date of the flight (YYYY-MM-DD format). This variable is used to extract year-level information and temporal patterns.
+
+**OP_CARRIER**  
+Two-letter airline carrier code identifying the operating airline (e.g., DL = Delta, WN = Southwest). This variable serves as a categorical predictor.
+
+**OP_CARRIER_FL_NUM**  
+Flight number assigned by the operating carrier. Although numeric, it functions as an identifier rather than a continuous variable.
+
+**ORIGIN**  
+Three-letter IATA airport code representing the departure airport (e.g., ATL = Atlanta, LAX = Los Angeles). This variable captures route-level information.
+
+**DEST**  
+Three-letter IATA airport code representing the destination airport. Used to identify route patterns and travel demand characteristics.
+
+**CRS_DEP_TIME**  
+Scheduled departure time in 24-hour HHMM format (e.g., 2152 = 9:52 PM). This variable is available prior to departure and may capture time-of-day effects.
+
+**ARR_DELAY**  
+Arrival delay in minutes. Positive values indicate late arrivals, while negative values indicate early arrivals. This variable is used to construct the binary response variable.
+
+**CANCELLED**  
+Indicator variable equal to 1 if the flight was cancelled and 0 otherwise. Cancelled flights were removed during data cleaning since arrival delay is undefined for cancelled flights.
+
+**DELAYED**  
+Binary indicator equal to 1 if ARR_DELAY ≥ 15 minutes and 0 otherwise. This variable serves as the response variable in the classification model.
+
+<br>
+
+## Visual EDA 
+
+Our data is almost ready to model, but before we do so lets visualize how some of the predictor variables effect the chance of a flight being delayed. 
+
+### Number of Flights Delayed vs. Not Delayed in data set
+
+
+First lets see how our data set is distributed between delayed and no delayed flights 
+
+
+```{r}
+flight_data_df %>%
+  count(delayed) %>%
+  ggplot(aes(x = delayed, y = n, fill = delayed)) +
+  geom_col() +
+  labs(
+    title = "Class Distribution of Flight Delays",
+    x = "Delay Status",
+    y = "Number of Flights"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+count_delayed <- sum(flight_data_df$delayed == "Delayed")
+count_not_delayed <- sum(flight_data_df$delayed == "Not Delayed")
+proportion_delayed <- signif(count_delayed /(count_delayed + count_not_delayed) *100, digits =2)
+proportion_not_delayed <- signif(count_not_delayed /(count_delayed + count_not_delayed) *100, digits=2)                 
+```
+
+
+This graph shows that the majority of flights within the data set are not delayed, more specifically the proportion of delayed flight is `r proportion_delayed`%  compared to the proportion of not delayed flight `r proportion_not_delayed`%. Because the proportion of non-delayed flights is much larger, this imbalance may affect the model’s ability to accurately predict delayed flights.
+
+<br>
+
+### Delay Rate by Airline
+```{r}
+flight_data_df %>%
+  group_by(OP_CARRIER) %>%
+  summarise(
+    delay_rate = mean(delayed == "Delayed", na.rm = TRUE),
+    n = n()
+  ) %>%
+  arrange(desc(delay_rate)) %>%
+  ggplot(aes(x = reorder(OP_CARRIER, delay_rate), 
+             y = delay_rate)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Delay Rate by Airline",
+    x = "Airline",
+    y = "Proportion Delayed"
+  )
+```
+
+
+The delay rate varies considerably across airlines, with proportions ranging from approximately 10% to 25%. This suggests that airline identity may be an important predictor of delay risk. Delays vary across airlines because of differences in operations, scheduling, and common flight paths. 
+
+<br>
+
+### Delay Rate by Hour of Departure
+```{r}
+flight_data_df <- flight_data_df %>%
+  mutate(
+    CRS_DEP_TIME = as.numeric(CRS_DEP_TIME),
+    dep_hour = floor(CRS_DEP_TIME / 100)
+  )
+
+flight_data_df %>%
+  filter(!is.na(dep_hour), dep_hour >= 0, dep_hour <= 23) %>%
+  group_by(dep_hour) %>%
+  summarise(delay_rate = mean(delayed == "Delayed", na.rm = TRUE)) %>%
+  ggplot(aes(x = dep_hour, y = delay_rate)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Delay Rate by Scheduled Departure Hour",
+    x = "Departure Hour (0–23)",
+    y = "Proportion Delayed"
+  )
+```
+
+<br>
+
+Delay probability changes greatly throughout the day. Early morning flights tend to exhibit lower delay rates, while delay probability increases steadily throughout the day, peaking in the late afternoon and evening. This makes sense considering the compounding nature of airline operations, where earlier disruptions effect later flight and so on.
+
+### Delay Rate by Origin × Destination (For top 15 routes only)
+```{r}
+top_origins <- flight_data_df %>%
+  count(ORIGIN, sort = TRUE) %>%
+  slice_head(n = 15) %>%
+  pull(ORIGIN)
+
+top_dests <- flight_data_df %>%
+  count(DEST, sort = TRUE) %>%
+  slice_head(n = 15) %>%
+  pull(DEST)
+
+route_summary <- flight_data_df %>%
+  filter(ORIGIN %in% top_origins,
+         DEST %in% top_dests) %>%
+  group_by(ORIGIN, DEST) %>%
+  summarise(
+    delay_rate = mean(delayed == "Delayed", na.rm = TRUE),
+    n = n(),
+    .groups = "drop"
+  )
+
+ggplot(route_summary, aes(x = DEST, y = ORIGIN, fill = delay_rate)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "red") +
+  labs(
+    title = "Heatmap of Delay Rate by Route",
+    x = "Destination Airport",
+    y = "Origin Airport",
+    fill = "Delay Rate"
+  ) +
+  theme_minimal()
+```
+
+<br>
+
+The heat map shows a lot of variation in delay rates across different routes. This means that certain origin–destination pairs have consistently higher delay probabilities, suggesting that route-level characteristics may contribute meaningfully to predictive performance.
+
+<br>
+
+## Setting up our Model 
+Now it is time to model our to see if we can predict if a flight is going to be delayed based of our predictors. The first step of this process is to split our data into training and testing. since the data set is very large we will split the data 70% training and 30% testing. 
+
+
+### Split Data into Testing and Training
+
+
+Before we do any model building, we first split the data into training and testing sets. For this dataset, I used a 70/30 split, where 70% of the data is used to train the models and the remaining 30% is reserved for testing. This allows the models to learn from a large portion of the data while still leaving a substantial amount of observations to evaluate how well the models perform on new, unseen data. The testing set acts as a final check on the model’s performance and helps prevent overfitting, where a model performs well on the training data but poorly on new data. A random seed is also set so that the split remains consistent each time the code is run.
+
+
+```{r, cache=TRUE}
+set.seed(14) 
+
+# Create Train index 
+train_index <- createDataPartition(
+  flight_data_df$delayed,
+  p = 0.7,
+  list = FALSE
+)
+
+test_data <- flight_data_df[-train_index, ] # keep other 30% of the rows
+train_data <- flight_data_df[train_index, ]
+```
+
+<br>
+
+### Stratify data on the Outcome Variable
+
+
+Now that the data is split we need to stratify on the outcome variable, delayed.
+```{r}
+prop.table(table(train_data$delayed))
+prop.table(table(test_data$delayed))
+```
+
+
+The stratification worked because both training and testing sets have very similar Delayed and Not Delayed percentages. 
+
+<br>
+
+### Recipe Specification
+
+
+The first step in to set up the model appropriately is to remove the variables ARR_DELAY and CANCELLED. ARR_DELAY must be removed because it was used to create the variable delayed (the outcome variable). Flight number was also excluded because it functions primarily as an identifier rather than a meaningful predictor. For computational feasibility, origin and destination airports outside the top 30 most common categories were grouped as “OTHER” when needed for specific models.
+CANCELLED is removed because all cancelled flights have already been removed so this variable is unnecessary. Then we will make sure all categorical variables are factors.
+
+
+```{r}
+train_data <- train_data |>
+  select(-ARR_DELAY, -CANCELLED)
+
+test_data <- test_data |>
+  select(-ARR_DELAY, -CANCELLED)
+```  
+
+
+Now we must consider that our dummy matrix will be to large and will crash. To reduce the amount we will keep only the top 30 ORIGIN an DEST airports and group the rest as "OTHER". We will also drop flight number from dummy encoding because it is just an identifier and generally a bad predictor. For example if there is schedule or aircraft changes the ML model will not be about to generalize.
+
+
+```{r, cache=TRUE}
+#Remove OP_CARRIER_FL_NUM from Training and Testing Data
+train_data <- train_data %>% select(-OP_CARRIER_FL_NUM)
+test_data  <- test_data %>% select(-OP_CARRIER_FL_NUM)
+
+
+# keep just the top 30 most mentioned airports
+top_airports <- train_data %>%
+  count(ORIGIN, sort = TRUE) %>%
+  slice_head(n = 30) %>%
+  pull(ORIGIN)
+
+#Classify not top 30 airports as "OTHER"
+
+train_data <- train_data |>
+  mutate(
+    ORIGIN = ifelse(ORIGIN %in% top_airports, ORIGIN, "OTHER"),
+    DEST   = ifelse(DEST %in% top_airports, DEST,   "OTHER")
+  )
+
+test_data <- test_data %>%
+  mutate(
+    ORIGIN = ifelse(ORIGIN %in% top_airports, ORIGIN, "OTHER"),
+    DEST   = ifelse(DEST   %in% top_airports, DEST,   "OTHER")
+  )
+
+```
+
+<br>
+
+### Transform Categorical Variables into Factors 
+```{r, cache=TRUE}
+# Turn outcome variable into factor
+train_data$delayed <- factor(train_data$delayed, levels = c("Not Delayed", "Delayed"))
+test_data$delayed  <- factor(test_data$delayed,  levels = c("Not Delayed", "Delayed"))
+
+# convert categorical variables to factors 
+train_x <- train_data |>
+  mutate(OP_CARRIER = factor(OP_CARRIER),
+         ORIGIN = factor(ORIGIN),
+         DEST = factor(DEST)) |>
+  select(-delayed)
+
+test_x <- test_data |>
+  mutate(OP_CARRIER = factor(OP_CARRIER),
+         ORIGIN = factor(ORIGIN),
+         DEST = factor(DEST)) |>
+  select(-delayed)
+```
+
+
+<br>
+
+### Dummy Encoding Variables 
+
+Some of the predictor variables in the dataset are categorical, such as airline carrier, origin airport, and destination airport. Since many machine learning models require numerical inputs, these categorical variables need to be converted into a numeric format. To accomplish this, dummy (one-hot) encoding is used, which creates separate binary indicator variables for each category. This allows the models to incorporate categorical information without incorrectly implying any numerical ordering between categories.
+
+
+```{r, cache=TRUE}
+dummies <- dummyVars(~ ., data = train_x, fullRank = TRUE)
+
+train_processed <- as.data.frame(predict(dummies, newdata = train_x))
+test_processed  <- as.data.frame(predict(dummies, newdata = test_x))
+
+# Add outcome back
+train_processed$delayed <- train_data$delayed
+test_processed$delayed  <- test_data$delayed
+```
+
+<br>
+
+### Center and Scale features 
+
+Numeric predictor variables are centered and scaled before modeling. Centering subtracts the mean from each feature, and scaling divides by the standard deviation. This ensures that predictors are on a similar scale, which can improve performance of certain models.
+
+
+```{r}
+preproc <- preProcess(train_processed[, -which(names(train_processed) == "delayed")],
+                      method = c("center", "scale"))
+
+train_processed[, -which(names(train_processed) == "delayed")] <-
+  predict(preproc, train_processed[, -which(names(train_processed) == "delayed")])
+
+test_processed[, -which(names(test_processed) == "delayed")] <-
+  predict(preproc, test_processed[, -which(names(test_processed) == "delayed")])
+```
+
+<br>
+
+## K-Fold Cross Validation
+
+In this step we will set the rules for model training used 5-fold cross-validation on the training set. Because the outcome variable is a factor, we will resample in caret is stratified, meaning each fold preserves the proportion of delayed and non-delayed flights. Performance will then be summarized using ROC/AUC (with class probabilities enabled), and predictions from cross-validation will be saved for later evaluation.
+
+
+```{r}
+set.seed(14) 
+
+# Use a 5-fold CV
+ctrl <- trainControl(  # set rules for training 
+  method = "cv", # cross validation 
+  number = 5, # 5 fold cross validation
+  classProbs = TRUE,  # compute probabilities for classes 
+  summaryFunction = twoClassSummary,
+  savePredictions = "final" # save predictions made during cross-validation 
+)
+
+train_data$delayed <- relevel(train_data$delayed, ref = "Delayed")
+test_data$delayed  <- relevel(test_data$delayed,  ref = "Delayed")
+```
+
+<br>
+
+## Fit model Types 
+
+
+Now it is finally time to fit and evaluate our models in order to find the one that is best at predicting flight delays from our data. Because the response variable indicates whether a flight was delayed or not, classification models were appropriate for this problem. The models tested include logistic regression, random forest, linear discriminant analysis (LDA), and a CART decision tree. Each model was trained using the same predictors so their performance could be compared consistently.
+
+
+### 1. Logistic Regression
+
+**Preparing Data for the Logistic Regression Model**
+```{r, cache=TRUE}
+train_lr <- train_data |>
+  mutate(
+    # CRS_DEP_TIME is formatted like 1325 (1:25 PM)
+    # Convert to numeric hour: 1325 -> 13
+    dep_hour = floor(as.numeric(CRS_DEP_TIME) / 100),
+    # Extract year from date (YYYY-MM-DD)
+    year = as.integer(substr(FL_DATE, 1, 4)),
+    # Extract month from date (YYYY-MM-DD)
+    month = as.integer(substr(FL_DATE, 6, 7))
+  ) |>
+   # Keep only outcome + predictors for this baseline    model
+  select(delayed, OP_CARRIER, ORIGIN, DEST, dep_hour, year, month) |>
+  # Remove rows where dep_hour is missing
+  filter(!is.na(dep_hour), dep_hour >= 0, dep_hour <= 23)
+
+test_lr <- test_data |>
+  mutate(
+    dep_hour = floor(as.numeric(CRS_DEP_TIME) / 100),
+    year = as.integer(substr(FL_DATE, 1, 4)),
+    month = as.integer(substr(FL_DATE, 6, 7))
+  ) |>
+  select(delayed, OP_CARRIER, ORIGIN, DEST, dep_hour, year, month) |>
+  filter(!is.na(dep_hour), dep_hour >= 0, dep_hour <= 23)
+
+
+set.seed(14)
+# Fix Not Delayed to NotDelayed becuse speces are not allowed in the fit
+
+train_lr$delayed <- factor(train_lr$delayed,
+                           levels = c("Not Delayed", "Delayed"),
+                           labels = c("NotDelayed", "Delayed"))
+
+test_lr$delayed <- factor(test_lr$delayed,
+                          levels = c("Not Delayed", "Delayed"),
+                          labels = c("NotDelayed", "Delayed"))
+
+```
+
+<br>
+
+***Fit Logisitc Regression***
+```{r}
+logit_fit <- train(
+  delayed ~ ., #predict this variable (delayed) using all other columns 
+  data = train_lr,
+  method = "glm",  # model is generalized linear model
+  family = binomial(), # logistic regression
+  metric = "ROC",
+  trControl = ctrl # cross validation we created 
+)
+
+logit_fit
+
+```
+
+
+The model achieved an ROC value of about 0.63, which suggests it performs slightly better than random guessing but is still relatively weak at predicting delays. The model shows extremely high sensitivity but very low specificity, meaning it predicts most flights as not delayed. This behavior is likely due to the strong class imbalance in the data set, where roughly 82% of flights are not delayed.
+
+<br>
+
+### 2. Random Forest
+
+
+For this model we will need to randomly sample 100,000 rows because keeping all the rows will cause the random forest model to fail from memory exhaustion. 
+
+
+```{r, cache=TRUE}
+# Convert variables to factors
+train_rf <- train_lr %>%
+  mutate(
+    OP_CARRIER = factor(OP_CARRIER),
+    ORIGIN = factor(ORIGIN),
+    DEST = factor(DEST),
+    delayed = factor(delayed, levels = c("NotDelayed", "Delayed"))
+  )
+
+test_rf <- test_lr %>%
+  mutate(
+    OP_CARRIER = factor(OP_CARRIER, levels = levels(train_rf$OP_CARRIER)),
+    ORIGIN = factor(ORIGIN, levels = levels(train_rf$ORIGIN)),
+    DEST = factor(DEST, levels = levels(train_rf$DEST)),
+    delayed = factor(delayed, levels = c("NotDelayed", "Delayed"))
+  )
+
+# Create a smaller stratified sample for random forest
+set.seed(14)
+
+rf_index <- createDataPartition(
+  train_rf$delayed,
+  p = 100000 / nrow(train_rf),
+  list = FALSE
+)
+
+train_rf_small <- train_rf[rf_index, ]
+
+# Check class balance
+prop.table(table(train_rf_small$delayed))
+
+```
+
+<br>
+
+***Fit the model on the sample***
+```{r, cache=TRUE}
+set.seed(14)
+
+rf_fit <- train(
+  delayed ~ .,
+  data = train_rf_small,
+  method = "rf",
+  metric = "ROC",
+  trControl = ctrl,
+  ntree = 100,
+  tuneLength = 2
+)
+
+rf_fit
+```
+
+
+The random forest performed slightly worse than the logistic regression model. The best version of the model acheived a cross-validated ROC of about 0.60. One difference compared to logistic regression model is that the random forest predicted more flights as delayed, which increased the specificity to around 0.14. However, the overall predictive performance was still fairly limited. This suggests that even with a more flexible model that can capture nonlinear relationships, the available predictors do not contain enough information to accurately identify delayed flights.
+
+<br>
+
+### 3. LDA (Linear Discriminant Analysis)
+
+***Fit the model***
+```{r, cache=TRUE}
+set.seed(14)
+
+lda_fit <- train(
+  delayed ~ .,
+  data = train_lr,
+  method = "lda",
+  metric = "ROC",
+  trControl = ctrl
+)
+
+lda_fit
+```
+
+
+The LDA model performed very similarly to the logistic regression model, with a cross-validated ROC of about 0.63. The model predicted almost all flights as not delayed, leading to extremely high sensitivity but very low specificity. This indicates that while the model can easily identify flights that are not delayed, it struggles to correctly identify delayed flights
+
+ <br>
+
+### 4. Pruned Decision Tree (CART)
+
+***Fit model***
+```{r}
+set.seed(14)
+
+tree_fit <- train(
+  delayed ~ .,
+  data = train_lr,
+  method = "rpart",
+  metric = "ROC",
+  trControl = ctrl,
+  tuneLength = 5
+)
+
+tree_fit
+```
+
+
+***Decision Tree Plot*** 
+```{r}
+library(rpart.plot)
+
+rpart.plot(tree_fit$finalModel)
+```
+
+
+The CART decision tree performed the worst out of the models tested, with a cross-validated ROC of about 0.54. Like the other models, it predicted nearly all flights as not delayed, resulting in extremely high sensitivity but very low specificity. This indicates that the decision tree was not able to effectively separate delayed and non-delayed flights using the available predictors.
+
+
+<br>
+
+
+# The Winner is Logistic Regression! 
+
+
+To determine the final model used for prediction, the performance of all models was compared using AUC and accuracy on the validation results. Logistic regression achieved the highest AUC (approximately 0.64), followed closely by LDA. Random forest and CART produced lower AUC values. Therefore, logistic regression was selected as the primary model used to predict delays on the testing data set.
+
+
+
+### Evaluate Logistic Regression on Test Data
+
+```{r, echo=FALSE, out.width="80%", fig.align="center"}
+knitr::include_graphics("1_blOad1e0c5V8EsTx03chWg.gif")
+```
+
+
+```{r}
+# Class probabilities
+logit_prob <- predict(logit_fit, newdata = test_lr, type = "prob")
+#Gives probabilities. for each class
+
+# Class predictions (default threshold = 0.5)
+logit_pred <- predict(logit_fit, newdata = test_lr)
+
+# Confusion matrix (Compares predicted class to actual classes)
+confusionMatrix(logit_pred, test_lr$delayed)
+
+# AUC
+roc_obj <- roc(response = test_lr$delayed,
+                     predictor = logit_prob[,"Delayed"])
+auc(roc_obj)  
+
+```
+
+
+## ROC Curve
+
+Let’s take a look at the ROC curve
+```{r}
+plot(roc_obj, col="blue", lwd=3,
+     main="ROC Curve for Logistic Regression Model")
+abline(a=0,b=1,lty=2,col="gray")
+```
+
+
+## Model Comparison Table 
+```{r}
+# Extract ROC values from each model
+model_results <- data.frame(
+  Model = c("Logistic Regression", "Random Forest", "LDA", "CART Decision Tree"),
+  ROC = c(
+    max(logit_fit$results$ROC),
+    max(rf_fit$results$ROC),
+    max(lda_fit$results$ROC),
+    max(tree_fit$results$ROC)
+  )
+)
+
+# Round values for cleaner display
+model_results$ROC <- round(model_results$ROC, 3)
+
+# Print table
+model_results
+
+```
+
+<br>
+
+
+The logistic regression model was selected as the final model based on its cross-validated ROC performance. After evaluating this model on the testing data set the  resulting ROC AUC was found to be 0.63. This means the model has  modest ability to distinguish between delayed and non-delayed flights. The confusion matrix shows that the model correctly identifies most non-delayed flights but struggles to correctly classify delayed flights, which is likely due to the strong class imbalance present in the data set.
+
+
+```{r, echo=FALSE, fig.align="center", out.width="80%"}
+knitr::include_graphics("RelaxedAIrTravelor .jpg")
+```
+
+
+<br>
+<br>
+
+# Conclusion
+
+This project explored the ability of several classification models to predict whether a flight would be delayed. The models tested included logistic regression, random forest, linear discriminant analysis (LDA), and a CART decision tree. All models were trained using the same set of predictors, including airline carrier, origin and destination airports, departure hour, year, and month. Based on the cross-validated ROC results, logistic regression and LDA performed the best, both achieving ROC values around 0.63, while random forest and the decision tree performed slightly worse. When evaluated on the testing data set, the logistic regression model showed similar performance, indicating only modest predictive ability.
+
+
+This project was personally interesting to me because I have experienced the frustration of flight delays myself. It is fascinating to see how machine learning can be used to predict events that I have wished I could know in advance. This analysis shows that while predicting delays is difficult, machine learning can still provide useful insight into patterns within large data sets.
+Thank you so much for reading !
+
+
+
+
+```{r, echo=FALSE, out.width="80%", fig.align="center"}
+knitr::include_graphics("Travel Fly GIF by Royal Jordanian.gif")
+```
+
